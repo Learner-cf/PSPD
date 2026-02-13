@@ -3,40 +3,54 @@ seed: 42
 
 output_dir: "outputs"
 
-calibration:
-  enabled: true
-  num_images: 1500
-  target_pass_rate: 0.60
-
 datasets:
   cuhk:
     image_root: "/root/autodl-tmp/PSPD/dataset/CUHK-PEDES/imgs"
     ann_file: "/root/autodl-tmp/PSPD/dataset/CUHK-PEDES/reid_raw.json"
   icfg:
     image_root: "/root/autodl-tmp/PSPD/dataset/ICFG-PEDES"
-    ann_file:  "/root/autodl-tmp/PSPD/dataset/ICFG-PEDES/ICFG-PEDES.json"
+    ann_file: "/root/autodl-tmp/PSPD/dataset/ICFG-PEDES/ICFG-PEDES.json"
   rstp:
     image_root: "/root/autodl-tmp/PSPD/dataset/RSTPReid"
-    ann_file:  "/root/autodl-tmp/PSPD/dataset/RSTPReid/data_captions.json"
+    ann_file: "/root/autodl-tmp/PSPD/dataset/RSTPReid/data_captions.json"
 
 extractor:
-  type: "instructblip_hf"
+  type: "qwen2_vl_hf"
   num_samples: 3
-  hf_model_name: "/root/autodl-tmp/PSPD/hf_models/instructblip-flan-t5-xl"
+  max_words: 3
+  hf_model_name: "/root/autodl-tmp/PSPD/hf_models/Qwen2-VL-7B-Instruct"
   generation:
-    max_new_tokens: 256
+    max_new_tokens: 24
     do_sample: true
+    temperature: 0.9
     top_p: 0.9
-    temperature: 0.8
+    repetition_penalty: 1.05
 
 teacher:
   enabled: true
-  backend: transformers_clip
-  model_dir: /root/autodl-tmp/PSPD/hf_models/openclip
+  backend: "open_clip"
+  model_name: "ViT-B-16"
+  pretrained: ""  # not used when local_weights_path is set
+  image_size: 224
+  local_weights_path: "/root/autodl-tmp/PSPD/hf_models/openclip/open_clip_pytorch_model.bin"
   tau_teacher: 0.01
+
+field_ranking:
+  enabled: true
+  delta_margin:
+    gender: 0.02
+    upper_type: 0.02
+    upper_color: 0.02
+    lower_type: 0.02
+    lower_color: 0.02
+  delta_global: 0.03
+
+lexicon:
+  path: "configs/lexicon.yaml"
+  max_per_field: 250
 
 labels:
   colors: ["black","white","gray","red","blue","green","brown","yellow"]
-  upper_types: ["tshirt","shirt","hoodie_sweater","jacket_coat","dress","other"]
+  upper_types: ["tshirt","shirt","sweater","hoodie","sweatshirt","jacket","coat","blazer","vest","dress","other"]
   lower_types: ["pants","jeans","shorts","skirt","other"]
   genders: ["male","female","unknown"]

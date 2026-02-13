@@ -1,0 +1,69 @@
+gender:
+  - male
+  - man
+  - female
+  - woman
+
+upper_type:
+  - tshirt
+  - t-shirt
+  - tee
+  - shirt
+  - button-up shirt
+  - blouse
+  - sweater
+  - knit sweater
+  - cardigan
+  - hoodie
+  - hooded sweatshirt
+  - sweatshirt
+  - pullover
+  - jacket
+  - windbreaker
+  - bomber jacket
+  - coat
+  - overcoat
+  - trench coat
+  - blazer
+  - suit jacket
+  - vest
+  - gilet
+  - dress
+
+upper_color:
+  - black
+  - white
+  - gray
+  - grey
+  - red
+  - blue
+  - navy
+  - green
+  - brown
+  - beige
+  - khaki
+  - yellow
+
+lower_type:
+  - pants
+  - trousers
+  - slacks
+  - jeans
+  - denim jeans
+  - shorts
+  - skirt
+  - leggings
+
+lower_color:
+  - black
+  - white
+  - gray
+  - grey
+  - red
+  - blue
+  - navy
+  - green
+  - brown
+  - beige
+  - khaki
+  - yellow
