@@ -18,13 +18,17 @@ extractor:
   type: "qwen2_vl_hf"
   num_samples: 3
   max_words: 3
+  max_tries_per_field: 3
+  enforce_exact_n_samples: true
+  sample_batch_size: 8
   hf_model_name: "/root/autodl-tmp/PSPD/hf_models/Qwen2-VL-7B-Instruct"
   generation:
-    max_new_tokens: 24
+    max_new_tokens: 12
     do_sample: true
-    temperature: 0.9
-    top_p: 0.9
-    repetition_penalty: 1.05
+    temperature: 1.1
+    top_p: 0.95
+    top_k: 50
+    repetition_penalty: 1.0
 
 teacher:
   enabled: true
@@ -54,3 +58,12 @@ labels:
   upper_types: ["tshirt","shirt","sweater","hoodie","sweatshirt","jacket","coat","blazer","vest","dress","other"]
   lower_types: ["pants","jeans","shorts","skirt","other"]
   genders: ["male","female","unknown"]
+
+caption_rewrite:
+  hf_model_name: "/root/autodl-tmp/PSPD/hf_models/Qwen2-VL-7B-Instruct"
+  generation:
+    max_new_tokens: 48
+    do_sample: true
+    temperature: 0.9
+    top_p: 0.9
+    repetition_penalty: 1.05

@@ -6,14 +6,17 @@ from PIL import Image
 
 from preprocess.field_prompts import blip_prompt
 
+
 class Qwen2VLHFExtractor:
     """
     Qwen2-VL extractor:
-      - prompt/采样都���制field: value格式，无unknown
-      - 采样3次、尽量去重
+      - prompt/采样都限制field: value格式，无unknown
+      - 支持严格采样N次（每次1个结果）
+      - 支持把采样请求按batch送入模型以提高吞吐
       - 小图自动resize
       - decode仅取新生成tokens，若无field则自动补field
     """
+
     def __init__(
         self,
         model_name: str,
@@ -22,10 +25,12 @@ class Qwen2VLHFExtractor:
         device: str = "cuda",
         seed: int = 42,
         max_words: int = 3,
-        max_tries_per_field: int = 12,
+        max_tries_per_field: int = 3,
         min_image_side: int = 64,
+        enforce_exact_n_samples: bool = True,
+        sample_batch_size: int = 8,
     ):
-        from transformers import AutoProcessor, AutoModelForVision2Seq
+        from transformers import AutoModelForVision2Seq, AutoProcessor
 
         self.num_samples = int(num_samples)
         self.device = device
@@ -33,6 +38,8 @@ class Qwen2VLHFExtractor:
 
         self.max_tries_per_field = int(max_tries_per_field)
         self.min_image_side = int(min_image_side)
+        self.enforce_exact_n_samples = bool(enforce_exact_n_samples)
+        self.sample_batch_size = max(1, int(sample_batch_size))
 
         self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
@@ -45,13 +52,14 @@ class Qwen2VLHFExtractor:
         ).to(device)
         self.model.eval()
 
-        # generation config
+        # generation config (偏多样化)
         self.gen_cfg = dict(gen_cfg)
-        self.gen_cfg.setdefault("max_new_tokens", 24)
+        self.gen_cfg.setdefault("max_new_tokens", 12)
         self.gen_cfg.setdefault("do_sample", True)
-        self.gen_cfg.setdefault("temperature", 0.8)
-        self.gen_cfg.setdefault("top_p", 0.9)
-        self.gen_cfg.setdefault("repetition_penalty", 1.05)
+        self.gen_cfg.setdefault("temperature", 1.1)
+        self.gen_cfg.setdefault("top_p", 0.95)
+        self.gen_cfg.setdefault("top_k", 50)
+        self.gen_cfg.setdefault("repetition_penalty", 1.0)
         self.gen_cfg.pop("num_beams", None)
 
         self.base_seed = int(seed)
@@ -93,24 +101,13 @@ class Qwen2VLHFExtractor:
             torch.cuda.manual_seed_all(s)
         return s
 
-    @torch.inference_mode()
-    def _gen_one(self, pil_image: Image.Image, field: str) -> str:
-        pil_image = self._ensure_image_ok(pil_image)
-        self._set_random_seed()
-        messages = self._build_messages(field)
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(text=text, images=pil_image, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        input_len = inputs["input_ids"].shape[-1]
-        out = self.model.generate(**inputs, **self.gen_cfg)  # (1, seq_len)
-        gen_ids = out[0][input_len:]
-        ans = self.processor.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+    def _postprocess_answer(self, ans: str, field: str) -> str:
+        ans = (ans or "").strip()
         if "\n" in ans:
             ans = ans.splitlines()[0].strip()
-        # 如不是"field: value"格式自动补前缀
         if not ans.lower().startswith(f"{field.lower()}:"):
             ans = f"{field}: {ans}"
-        # 彻底禁止unknown等
+
         ban = {"unknown", "unsure", "uncertain", "n/a", "none", "null"}
         v = ans.split(":")[-1].strip().lower()
         if v in ban:
@@ -118,11 +115,54 @@ class Qwen2VLHFExtractor:
         return ans
 
     @torch.inference_mode()
+    def _gen_batch(self, pil_image: Image.Image, field: str, n: int) -> List[str]:
+        pil_image = self._ensure_image_ok(pil_image)
+        self._set_random_seed()
+
+        messages = self._build_messages(field)
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+        texts = [text] * n
+        images = [pil_image] * n
+        inputs = self.processor(text=texts, images=images, return_tensors="pt", padding=True)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        input_lens = inputs["attention_mask"].sum(dim=-1).tolist()
+        out = self.model.generate(**inputs, **self.gen_cfg)  # (n, seq_len)
+
+        outputs: List[str] = []
+        for i in range(out.shape[0]):
+            start = int(input_lens[i])
+            gen_ids = out[i][start:]
+            ans = self.processor.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            outputs.append(self._postprocess_answer(ans, field))
+        return outputs
+
+    @torch.inference_mode()
+    def _gen_one(self, pil_image: Image.Image, field: str) -> str:
+        outs = self._gen_batch(pil_image, field, 1)
+        return outs[0] if outs else ""
+
+    @torch.inference_mode()
     def extract_field_n(self, pil_image: Image.Image, field: str) -> List[str]:
         """
-        生成 num_samples 个候选，优先用唯一值，多次尝试去重。
+        生成 num_samples 个候选。
+        默认严格执行“采样N次，每次只生成1次，不额外重试”，
+        但会把这些单次采样按sample_batch_size打包，以提升吞吐。
         """
         results: List[str] = []
+
+        if self.enforce_exact_n_samples:
+            remain = self.num_samples
+            while remain > 0:
+                cur = min(remain, self.sample_batch_size)
+                batch_out = self._gen_batch(pil_image, field, cur)
+                for s in batch_out:
+                    results.append(s if s else f"{field}: ")
+                remain -= cur
+            return results
+
+        # 兼容旧逻辑：尝试去重，允许额外重试。
         seen = set()
         max_tries = max(self.max_tries_per_field, self.num_samples)
         for _ in range(max_tries):
@@ -134,7 +174,7 @@ class Qwen2VLHFExtractor:
                 continue
             seen.add(key)
             results.append(s)
-        # 不足补齐
+
         while len(results) < self.num_samples:
             results.append(results[-1] if results else f"{field}: ")
         return results

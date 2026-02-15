@@ -1,0 +1,51 @@
+gender:
+  - male
+  - female
+
+upper_type:
+  - t-shirt
+  - shirt
+  - jacket
+  - coat
+  - sweater
+  - hoodie
+  - polo shirt
+  - blouse
+  - vest
+  - long-sleeve
+
+upper_color:
+  - black
+  - white
+  - blue
+  - red
+  - green
+  - yellow
+  - gray
+  - brown
+  - pink
+  - purple
+
+lower_type:
+  - pants
+  - jeans
+  - shorts
+  - skirt
+  - trousers
+  - leggings
+  - capri
+  - sweatpants
+  - culottes
+  - overalls
+
+lower_color:
+  - black
+  - blue
+  - gray
+  - white
+  - brown
+  - green
+  - red
+  - beige
+  - yellow
+  - khaki

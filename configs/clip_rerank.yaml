@@ -1,0 +1,16 @@
+device: "cuda"
+output_dir: "outputs"
+
+clip_rerank:
+  backend: "open_clip"  # open_clip | hf | auto
+  model_name_or_path: "/root/autodl-tmp/PSPD/hf_models/openclip"
+  open_clip_model_name: "ViT-B-16"
+  open_clip_pretrained: ""
+  slots_path: "configs/attr_slots.yaml"
+  threshold:
+    default: 20.0
+    gender: 20.0
+    upper_type: 20.0
+    upper_color: 20.0
+    lower_type: 20.0
+    lower_color: 20.0

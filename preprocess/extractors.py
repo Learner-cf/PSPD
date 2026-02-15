@@ -12,4 +12,7 @@ def build_extractor(cfg: Dict):
         device=cfg.get("device", "cuda"),
         seed=int(cfg.get("seed", 42)),
         max_words=int(cfg.get("extractor", {}).get("max_words", 3)),
+        max_tries_per_field=int(cfg.get("extractor", {}).get("max_tries_per_field", 3)),
+        enforce_exact_n_samples=bool(cfg.get("extractor", {}).get("enforce_exact_n_samples", True)),
+        sample_batch_size=int(cfg.get("extractor", {}).get("sample_batch_size", cfg["extractor"].get("num_samples", 3))),
     )
