@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 @dataclass
 class RankAuxConfig:
+    use_itc: bool = True
+    use_rank: bool = False
     lambda_rank: float = 0.2
     base_margin_12: float = 0.15
     base_margin_13: float = 0.20
@@ -111,18 +113,29 @@ class ITCWithRankAuxLoss(nn.Module):
         rerank_score_rk3: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        loss_itc = self.itc_loss(image_feat, caption_feat, logit_scale)
-        loss_rank = self.rank_loss(
-            sim_rk1=sim_rk1,
-            sim_rk2=sim_rk2,
-            sim_rk3=sim_rk3,
-            rerank_score_rk1=rerank_score_rk1,
-            rerank_score_rk2=rerank_score_rk2,
-            rerank_score_rk3=rerank_score_rk3,
-            valid_mask=valid_mask,
-        )
+        loss_itc = image_feat.new_zeros(())
+        loss_rank = image_feat.new_zeros(())
+        total = image_feat.new_zeros(())
 
-        total = loss_itc + self.cfg.lambda_rank * loss_rank
+        if self.cfg.use_itc:
+            loss_itc = self.itc_loss(image_feat, caption_feat, logit_scale)
+            total = total + loss_itc
+
+        if self.cfg.use_rank:
+            loss_rank = self.rank_loss(
+                sim_rk1=sim_rk1,
+                sim_rk2=sim_rk2,
+                sim_rk3=sim_rk3,
+                rerank_score_rk1=rerank_score_rk1,
+                rerank_score_rk2=rerank_score_rk2,
+                rerank_score_rk3=rerank_score_rk3,
+                valid_mask=valid_mask,
+            )
+            total = total + self.cfg.lambda_rank * loss_rank
+
+        if (not self.cfg.use_itc) and (not self.cfg.use_rank):
+            raise ValueError("At least one loss must be enabled: use_itc or use_rank.")
+
         stats = {
             "loss_total": total.detach(),
             "loss_itc": loss_itc.detach(),
