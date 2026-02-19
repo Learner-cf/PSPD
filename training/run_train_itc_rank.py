@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import logging
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -17,7 +18,28 @@ from training.itc_rank_aux_loss import ITCWithRankAuxLoss, RankAuxConfig
 
 FIELDS = ["gender", "upper_type", "upper_color", "lower_type", "lower_color"]
 
+# =============== 添加日志初始化函数 ===============
+def setup_logger(save_dir: str):
+    os.makedirs(save_dir, exist_ok=True)
+    logger = logging.getLogger("train_logger")
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s')
 
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+    # File handler
+    fh = logging.FileHandler(os.path.join(save_dir, "train.log"), "a", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    return logger
+
+# =============== 原有代码从这继续 ===============
 def resolve_clip_backend(backend: str, model_path: str) -> str:
     b = (backend or "auto").strip().lower()
     if b in {"hf", "open_clip"}:
@@ -26,7 +48,6 @@ def resolve_clip_backend(backend: str, model_path: str) -> str:
     if has_open_clip:
         return "open_clip"
     return "hf"
-
 
 def load_clip_components(model_path: str, backend: str, device: str):
     if backend == "hf":
@@ -47,12 +68,10 @@ def load_clip_components(model_path: str, backend: str, device: str):
 
     raise ValueError(f"Unsupported clip backend: {backend}")
 
-
 def encode_image_features(model: Any, backend: str, pixel_values: torch.Tensor) -> torch.Tensor:
     if backend == "hf":
         return model.get_image_features(pixel_values=pixel_values)
     return model.encode_image(pixel_values)
-
 
 def encode_text_features(model: Any, backend: str, tokens: Dict[str, torch.Tensor]) -> torch.Tensor:
     if backend == "hf":
@@ -62,6 +81,44 @@ def encode_text_features(model: Any, backend: str, tokens: Dict[str, torch.Tenso
         )
     return model.encode_text(tokens["input_ids"])
 
+def set_text_trainable(
+    model: Any,
+    backend: str,
+    train_encoder: bool,
+    train_proj: bool,
+) -> None:
+    if backend == "hf":
+        if hasattr(model, "text_model"):
+            for p in model.text_model.parameters():
+                p.requires_grad = train_encoder
+        if hasattr(model, "text_projection") and isinstance(model.text_projection, torch.nn.Parameter):
+            model.text_projection.requires_grad = train_proj
+        return
+
+    if backend == "open_clip":
+        for attr in ("transformer", "token_embedding", "ln_final"):
+            module = getattr(model, attr, None)
+            if module is not None and hasattr(module, "parameters"):
+                for p in module.parameters():
+                    p.requires_grad = train_encoder
+
+        if hasattr(model, "positional_embedding") and isinstance(model.positional_embedding, torch.nn.Parameter):
+            model.positional_embedding.requires_grad = train_encoder
+        if hasattr(model, "text_projection") and isinstance(model.text_projection, torch.nn.Parameter):
+            model.text_projection.requires_grad = train_proj
+        return
+
+    raise ValueError(f"Unsupported clip backend: {backend}")
+
+def count_trainable_params(model: Any) -> Tuple[int, int]:
+    total = 0
+    trainable = 0
+    for p in model.parameters():
+        n = p.numel()
+        total += n
+        if p.requires_grad:
+            trainable += n
+    return trainable, total
 
 def load_cfg(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -69,7 +126,6 @@ def load_cfg(path: str) -> Dict:
     if not isinstance(cfg, dict):
         raise RuntimeError(f"Config must be dict, got: {type(cfg)}")
     return cfg
-
 
 def load_jsonl(path: str) -> List[Dict]:
     rows: List[Dict] = []
@@ -80,9 +136,6 @@ def load_jsonl(path: str) -> List[Dict]:
                 continue
             rows.append(json.loads(line))
     return rows
-
-
-
 
 def resolve_image_path(path: str, image_roots: List[str]) -> str:
     candidates: List[str] = []
@@ -131,10 +184,8 @@ def resolve_image_path(path: str, image_roots: List[str]) -> str:
 
     return ""
 
-
 def normalize_value(v: str) -> str:
     return (v or "").strip().lower()
-
 
 def field_prompt(field: str, value: str) -> str:
     if field == "gender":
@@ -149,10 +200,19 @@ def field_prompt(field: str, value: str) -> str:
         return f"a photo of a person wearing {value} lower clothing"
     return f"a photo of a person with {value}"
 
-
 class ITCRankDataset(Dataset):
-    def __init__(self, jsonl_path: str):
-        self.rows = load_jsonl(jsonl_path)
+    def __init__(self, jsonl_path: str, image_roots: List[str]):
+        raw_rows = load_jsonl(jsonl_path)
+        self.rows: List[Dict] = []
+        for row in raw_rows:
+            if "image_path" not in row:
+                continue
+            resolved = resolve_image_path(str(row["image_path"]), image_roots)
+            if not resolved:
+                continue
+            nr = dict(row)
+            nr["image_path"] = resolved
+            self.rows.append(nr)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -173,7 +233,11 @@ class ITCRankDataset(Dataset):
         image = Image.open(row["image_path"]).convert("RGB")
 
         caption_obj = row.get("caption_rewrite", {})
-        caption = str(caption_obj.get("caption", "")).strip()
+        caption = str(caption_obj.get("caption", "")).strip() if isinstance(caption_obj, dict) else ""
+        if not caption and isinstance(row.get("caption"), str):
+            caption = row["caption"].strip()
+        if (not caption) and isinstance(row.get("captions"), list) and len(row["captions"]) > 0:
+            caption = str(row["captions"][0]).strip()
         if not caption:
             caption = "a person"
 
@@ -212,7 +276,6 @@ class ITCRankDataset(Dataset):
             "score_rk3": s3,
             "valid_mask": valid,
         }
-
 
 class RetrievalEvalDataset(Dataset):
     def __init__(self, jsonl_path: str, image_roots: List[str]):
@@ -276,7 +339,6 @@ class RetrievalEvalDataset(Dataset):
         image = Image.open(self.image_paths[idx]).convert("RGB")
         return {"image": image, "pid": self.image_pids[idx], "index": idx}
 
-
 def build_collate(
     backend: str,
     processor: CLIPProcessor = None,
@@ -333,7 +395,6 @@ def build_collate(
 
     return _collate
 
-
 def to_device(d: Dict, device: str) -> Dict:
     out = {}
     for k, v in d.items():
@@ -342,7 +403,6 @@ def to_device(d: Dict, device: str) -> Dict:
         else:
             out[k] = v
     return out
-
 
 @torch.no_grad()
 def evaluate_retrieval(
@@ -431,7 +491,6 @@ def evaluate_retrieval(
     model.train()
     return {"rank1": rank1, "rank5": rank5, "rank10": rank10, "mAP": mAP}
 
-
 def train_one_epoch(
     model: Any,
     backend: str,
@@ -518,19 +577,18 @@ def train_one_epoch(
         "loss_rank": meter["loss_rank"] / n,
     }
 
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default="configs/default.yaml")
-    ap.add_argument("--train_jsonl", type=str, default="outputs/cuhk_train_qwen_caption_v1.jsonl")
+    ap.add_argument("--train_jsonl", type=str, default="outputs/cuhk_train_qwen_caption_v2.jsonl")
     ap.add_argument("--clip_model_path", type=str, default="/root/autodl-tmp/PSPD/hf_models/openclip")
     ap.add_argument("--clip_backend", type=str, default="auto", choices=["auto", "hf", "open_clip"])
-    ap.add_argument("--save_dir", type=str, default="outputs/checkpoints_itc_rank")
-    ap.add_argument("--test_jsonl", type=str, default="")
-    ap.add_argument("--epochs", type=int, default=10)
-    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--save_dir", type=str, default="outputs/checkpoints_itc_rank2")
+    ap.add_argument("--test_jsonl", type=str, default="outputs/cuhk_test_caption.jsonl")
+    ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--lr", type=float, default=1e-5)
-    ap.add_argument("--weight_decay", type=float, default=1e-4)
+    ap.add_argument("--weight_decay", type=float, default=2e-5)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--lambda_rank", type=float, default=0.2)
@@ -542,9 +600,16 @@ def main() -> None:
     ap.add_argument("--use_itc_loss", type=int, default=1, choices=[0, 1])
     ap.add_argument("--use_rank_loss", type=int, default=0, choices=[0, 1])
     ap.add_argument("--eval_batch_size", type=int, default=128)
-    ap.add_argument("--eval_image_root", type=str, default="")
+    ap.add_argument("--train_image_root", type=str, default="/root/autodl-tmp/PSPD/dataset/CUHK-PEDES")
+    ap.add_argument("--eval_image_root", type=str, default="/root/autodl-tmp/PSPD/dataset/CUHK-PEDES")
     ap.add_argument("--show_progress", type=int, default=1, choices=[0, 1])
+    ap.add_argument("--freeze_text_encoder", type=int, default=1, choices=[0, 1])
+    ap.add_argument("--freeze_text_proj", type=int, default=0, choices=[0, 1])
     args = ap.parse_args()
+
+    # ============== 初始化日志 ==============
+    logger = setup_logger(args.save_dir)
+    logger.info("========== Training Start ==========")
 
     if not args.test_jsonl:
         raise ValueError(
@@ -567,6 +632,10 @@ def main() -> None:
 
     os.makedirs(args.save_dir, exist_ok=True)
 
+    train_image_roots: List[str] = []
+    if args.train_image_root:
+        train_image_roots.append(args.train_image_root)
+
     eval_image_roots: List[str] = []
     if args.eval_image_root:
         eval_image_roots.append(args.eval_image_root)
@@ -577,21 +646,33 @@ def main() -> None:
             if isinstance(ds_cfg, dict):
                 root = ds_cfg.get("image_root", "")
                 if root:
+                    train_image_roots.append(root)
                     eval_image_roots.append(root)
                     parent = os.path.dirname(root.rstrip('/'))
                     if parent:
+                        train_image_roots.append(parent)
                         eval_image_roots.append(parent)
 
     # dedup roots while keeping order
-    dedup_roots: List[str] = []
-    seen_roots = set()
+    dedup_train_roots: List[str] = []
+    seen_train_roots = set()
+    for r in train_image_roots:
+        rr = os.path.abspath(r)
+        if rr in seen_train_roots:
+            continue
+        seen_train_roots.add(rr)
+        dedup_train_roots.append(rr)
+    train_image_roots = dedup_train_roots
+
+    dedup_eval_roots: List[str] = []
+    seen_eval_roots = set()
     for r in eval_image_roots:
         rr = os.path.abspath(r)
-        if rr in seen_roots:
+        if rr in seen_eval_roots:
             continue
-        seen_roots.add(rr)
-        dedup_roots.append(rr)
-    eval_image_roots = dedup_roots
+        seen_eval_roots.add(rr)
+        dedup_eval_roots.append(rr)
+    eval_image_roots = dedup_eval_roots
 
     backend = resolve_clip_backend(args.clip_backend, args.clip_model_path)
     model, processor, oc_preprocess, oc_tokenizer = load_clip_components(
@@ -599,9 +680,31 @@ def main() -> None:
         backend=backend,
         device=device,
     )
-    print(f"[info] clip backend: {backend}")
+    logger.info(f"clip backend: {backend}")
 
-    dataset = ITCRankDataset(args.train_jsonl)
+    freeze_text_encoder = bool(args.freeze_text_encoder)
+    freeze_text_proj = bool(args.freeze_text_proj)
+
+    if freeze_text_encoder or freeze_text_proj:
+        set_text_trainable(
+            model=model,
+            backend=backend,
+            train_encoder=not freeze_text_encoder,
+            train_proj=not freeze_text_proj,
+        )
+        logger.info(
+            f"text freeze settings: freeze_encoder={freeze_text_encoder}, freeze_proj={freeze_text_proj}"
+        )
+
+    trainable_params, total_params = count_trainable_params(model)
+    logger.info(f"trainable params: {trainable_params}/{total_params}")
+
+    dataset = ITCRankDataset(args.train_jsonl, image_roots=train_image_roots)
+    if len(dataset) == 0:
+        raise RuntimeError(
+            "No valid training images found. Please check --train_jsonl paths or set --train_image_root. "
+            "Current roots: " + str(train_image_roots)
+        )
     eval_dataset = RetrievalEvalDataset(args.test_jsonl, image_roots=eval_image_roots)
     if len(eval_dataset.image_paths) == 0:
         raise RuntimeError(
@@ -629,19 +732,25 @@ def main() -> None:
     )
     loss_fn = ITCWithRankAuxLoss(rank_cfg)
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optim_params = [p for p in model.parameters() if p.requires_grad]
+    if len(optim_params) == 0:
+        raise RuntimeError("No trainable parameters found. Please check freeze flags or model.")
+    optimizer = AdamW(optim_params, lr=args.lr, weight_decay=args.weight_decay)
 
     meta = {
         "train_jsonl": args.train_jsonl,
         "clip_model_path": args.clip_model_path,
         "clip_backend": backend,
         "test_jsonl": args.test_jsonl,
+        "train_image_root": args.train_image_root,
         "eval_image_root": args.eval_image_root,
         "rank_cfg": asdict(rank_cfg),
         "batch_size": args.batch_size,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "epochs": args.epochs,
+        "freeze_text_encoder": freeze_text_encoder,
+        "freeze_text_proj": freeze_text_proj,
     }
     with open(Path(args.save_dir) / "train_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -686,8 +795,9 @@ def main() -> None:
             best = stats["loss_total"]
             torch.save(ckpt, Path(args.save_dir) / "best.pt")
 
-        print(
+        log_str = (
             f"[epoch {epoch:03d}] "
+            f"best_loss={best:.6f} "
             f"loss_total={stats['loss_total']:.6f} "
             f"loss_itc={stats['loss_itc']:.6f} "
             f"loss_rank={stats['loss_rank']:.6f} "
@@ -697,6 +807,9 @@ def main() -> None:
             f"mAP={stats['mAP']:.4f}"
         )
 
+        print(log_str)
+        logger.info(log_str)
+    logger.info("========== Training Finished ==========")
 
 if __name__ == "__main__":
     main()
