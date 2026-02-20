@@ -4,19 +4,20 @@ import os
 import logging
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import torch
 import yaml
 from PIL import Image
+from sklearn.cluster import DBSCAN
+from sklearn.manifold import TSNE
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import CLIPModel, CLIPProcessor
 from tqdm.auto import tqdm
 
 from training.itc_rank_aux_loss import ITCWithRankAuxLoss, RankAuxConfig
-
-FIELDS = ["gender", "upper_type", "upper_color", "lower_type", "lower_color"]
 
 # =============== 添加日志初始化函数 ===============
 def setup_logger(save_dir: str):
@@ -218,63 +219,47 @@ class ITCRankDataset(Dataset):
         return len(self.rows)
 
     @staticmethod
-    def _get_rank_item(row: Dict, field: str, rank_idx: int) -> Tuple[str, float]:
-        rr = row.get("clip_rerank", {})
-        fobj = rr.get(field, {})
-        final_rank = fobj.get("final_rank", [])
-        if rank_idx < len(final_rank) and isinstance(final_rank[rank_idx], dict):
-            value = normalize_value(str(final_rank[rank_idx].get("value", "unknown")))
-            score = float(final_rank[rank_idx].get("score", 0.0))
-            return value if value else "unknown", score
-        return "unknown", 0.0
+    def _extract_captions(row: Dict) -> List[str]:
+        captions: List[str] = []
+
+        cap_obj = row.get("caption_rewrite", {})
+        if isinstance(cap_obj, dict):
+            if isinstance(cap_obj.get("captions"), list):
+                captions.extend([str(x).strip() for x in cap_obj["captions"] if str(x).strip()])
+            cap = str(cap_obj.get("caption", "")).strip()
+            if cap:
+                captions.append(cap)
+
+        if isinstance(row.get("captions"), list):
+            captions.extend([str(x).strip() for x in row["captions"] if str(x).strip()])
+
+        if isinstance(row.get("caption"), str) and row["caption"].strip():
+            captions.append(row["caption"].strip())
+
+        uniq_caps: List[str] = []
+        seen = set()
+        for caption in captions:
+            if caption in seen:
+                continue
+            seen.add(caption)
+            uniq_caps.append(caption)
+
+        if not uniq_caps:
+            uniq_caps = ["a person"]
+        return uniq_caps
 
     def __getitem__(self, idx: int) -> Dict:
         row = self.rows[idx]
         image = Image.open(row["image_path"]).convert("RGB")
 
-        caption_obj = row.get("caption_rewrite", {})
-        caption = str(caption_obj.get("caption", "")).strip() if isinstance(caption_obj, dict) else ""
-        if not caption and isinstance(row.get("caption"), str):
-            caption = row["caption"].strip()
-        if (not caption) and isinstance(row.get("captions"), list) and len(row["captions"]) > 0:
-            caption = str(row["captions"][0]).strip()
-        if not caption:
-            caption = "a person"
-
-        rk1_vals: List[str] = []
-        rk2_vals: List[str] = []
-        rk3_vals: List[str] = []
-        s1: List[float] = []
-        s2: List[float] = []
-        s3: List[float] = []
-        valid: List[float] = []
-
-        for field in FIELDS:
-            v1, sc1 = self._get_rank_item(row, field, 0)
-            v2, sc2 = self._get_rank_item(row, field, 1)
-            v3, sc3 = self._get_rank_item(row, field, 2)
-
-            rk1_vals.append(field_prompt(field, v1))
-            rk2_vals.append(field_prompt(field, v2))
-            rk3_vals.append(field_prompt(field, v3))
-
-            s1.append(sc1)
-            s2.append(sc2)
-            s3.append(sc3)
-
-            is_valid = float(v1 != "unknown" and v2 != "unknown" and v3 != "unknown")
-            valid.append(is_valid)
+        captions = self._extract_captions(row)
+        pseudo_label = row.get("pseudo_label", row.get("pid", row.get("person_id", row.get("id", -1))))
 
         return {
             "image": image,
-            "caption": caption,
-            "rk1_texts": rk1_vals,
-            "rk2_texts": rk2_vals,
-            "rk3_texts": rk3_vals,
-            "score_rk1": s1,
-            "score_rk2": s2,
-            "score_rk3": s3,
-            "valid_mask": valid,
+            "image_path": row["image_path"],
+            "captions": captions,
+            "pseudo_label": str(pseudo_label),
         }
 
 class RetrievalEvalDataset(Dataset):
@@ -352,44 +337,36 @@ def build_collate(
 
     def _collate(batch: List[Dict]) -> Dict:
         images = [x["image"] for x in batch]
-        captions = [x["caption"] for x in batch]
+        caption_groups = [x["captions"] for x in batch]
+        flat_captions = [cap for caps in caption_groups for cap in caps]
+        text_to_image_index = torch.tensor(
+            [img_idx for img_idx, caps in enumerate(caption_groups) for _ in caps],
+            dtype=torch.long,
+        )
+
+        image_to_text_mask = torch.zeros(len(batch), len(flat_captions), dtype=torch.bool)
+        cursor = 0
+        for i, caps in enumerate(caption_groups):
+            image_to_text_mask[i, cursor: cursor + len(caps)] = True
+            cursor += len(caps)
 
         if backend == "hf":
-            main_inputs = processor(text=captions, images=images, return_tensors="pt", padding=True, truncation=True)
+            image_inputs = processor(images=images, return_tensors="pt")
+            text_inputs = processor.tokenizer(flat_captions, return_tensors="pt", padding=True, truncation=True)
         else:
-            main_inputs = {
+            image_inputs = {
                 "pixel_values": torch.stack([oc_preprocess(img.convert("RGB")) for img in images], dim=0),
-                "input_ids": oc_tokenizer(captions),
             }
-
-        def flatten_rank_texts(key: str) -> List[str]:
-            flat: List[str] = []
-            for sample in batch:
-                flat.extend(sample[key])
-            return flat
-
-        rk1_texts = flatten_rank_texts("rk1_texts")
-        rk2_texts = flatten_rank_texts("rk2_texts")
-        rk3_texts = flatten_rank_texts("rk3_texts")
-
-        tk1 = _tokenize(rk1_texts)
-        tk2 = _tokenize(rk2_texts)
-        tk3 = _tokenize(rk3_texts)
-
-        score_rk1 = torch.tensor([x["score_rk1"] for x in batch], dtype=torch.float32)
-        score_rk2 = torch.tensor([x["score_rk2"] for x in batch], dtype=torch.float32)
-        score_rk3 = torch.tensor([x["score_rk3"] for x in batch], dtype=torch.float32)
-        valid_mask = torch.tensor([x["valid_mask"] for x in batch], dtype=torch.float32)
+            text_inputs = {"input_ids": oc_tokenizer(flat_captions)}
 
         return {
-            "main_inputs": main_inputs,
-            "rk1_tokens": tk1,
-            "rk2_tokens": tk2,
-            "rk3_tokens": tk3,
-            "score_rk1": score_rk1,
-            "score_rk2": score_rk2,
-            "score_rk3": score_rk3,
-            "valid_mask": valid_mask,
+            "image_inputs": image_inputs,
+            "text_inputs": text_inputs,
+            "captions": flat_captions,
+            "image_paths": [x["image_path"] for x in batch],
+            "pseudo_labels": [x["pseudo_label"] for x in batch],
+            "text_to_image_index": text_to_image_index,
+            "image_to_text_mask": image_to_text_mask,
             "batch_size": len(batch),
         }
 
@@ -491,6 +468,187 @@ def evaluate_retrieval(
     model.train()
     return {"rank1": rank1, "rank5": rank5, "rank10": rank10, "mAP": mAP}
 
+@torch.no_grad()
+def extract_all_image_embeddings(model: Any, backend: str, dataloader: DataLoader, device: str):
+    model.eval()
+
+    all_image_features: List[torch.Tensor] = []
+    all_text_features: List[torch.Tensor] = []
+    all_paths: List[str] = []
+    all_labels: List[str] = []
+    has_any_label = False
+
+    for batch in dataloader:
+        image_inputs = to_device(batch["image_inputs"], device)
+        text_inputs = to_device(batch["text_inputs"], device)
+
+        image_feat = encode_image_features(model, backend, image_inputs["pixel_values"])
+        text_feat = encode_text_features(model, backend, text_inputs)
+
+        image_feat = image_feat / (image_feat.norm(dim=-1, keepdim=True) + 1e-6)
+        text_feat = text_feat / (text_feat.norm(dim=-1, keepdim=True) + 1e-6)
+
+        all_image_features.append(image_feat.cpu())
+        all_text_features.append(text_feat.cpu())
+        all_paths.extend(batch.get("image_paths", []))
+
+        labels = batch.get("pseudo_labels")
+        if labels is None:
+            all_labels.extend(["-1"] * image_feat.size(0))
+        else:
+            labels_str = [str(x) for x in labels]
+            all_labels.extend(labels_str)
+            if any(x not in {"", "-1", "none", "None"} for x in labels_str):
+                has_any_label = True
+
+    model.train()
+
+    image_features = torch.cat(all_image_features, dim=0) if all_image_features else torch.empty((0, 0))
+    text_features = torch.cat(all_text_features, dim=0) if all_text_features else torch.empty((0, 0))
+    labels_out = all_labels if has_any_label else None
+
+    return {
+        "image_features": image_features,
+        "text_features": text_features,
+        "paths": all_paths,
+        "labels": labels_out,
+    }
+
+
+def visualize_image_tsne(features: torch.Tensor, labels: Optional[List[str]], save_path: str) -> None:
+    if features.numel() == 0:
+        return
+
+    max_samples = min(2000, features.size(0))
+    feats = features[:max_samples]
+    sub_labels = labels[:max_samples] if labels is not None else None
+
+    reduced = TSNE(n_components=2, perplexity=30, random_state=42).fit_transform(feats.numpy())
+
+    plt.figure(figsize=(8, 8))
+    if sub_labels is not None:
+        uniq = {k: idx for idx, k in enumerate(sorted(set(sub_labels)))}
+        cvals = [uniq[k] for k in sub_labels]
+        plt.scatter(reduced[:, 0], reduced[:, 1], c=cvals, cmap="tab20", s=10, alpha=0.75)
+    else:
+        plt.scatter(reduced[:, 0], reduced[:, 1], c="blue", s=10, alpha=0.75)
+
+    plt.title("Image Embedding t-SNE")
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+
+def visualize_text_tsne(features: torch.Tensor, labels: Optional[List[str]], save_path: str) -> None:
+    if features.numel() == 0:
+        return
+
+    max_samples = min(2000, features.size(0))
+    feats = features[:max_samples]
+    sub_labels = labels[:max_samples] if labels is not None else None
+
+    reduced = TSNE(n_components=2, perplexity=30, random_state=42).fit_transform(feats.numpy())
+
+    plt.figure(figsize=(8, 8))
+    if sub_labels is not None:
+        uniq = {k: idx for idx, k in enumerate(sorted(set(sub_labels)))}
+        cvals = [uniq[k] for k in sub_labels]
+        plt.scatter(reduced[:, 0], reduced[:, 1], c=cvals, cmap="tab20", s=10, alpha=0.75)
+    else:
+        plt.scatter(reduced[:, 0], reduced[:, 1], c="red", s=10, alpha=0.75)
+
+    plt.title("Text Embedding t-SNE")
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+
+def visualize_joint_tsne(
+    image_features: torch.Tensor,
+    text_features: torch.Tensor,
+    labels: Optional[List[str]],
+    save_path: str,
+) -> None:
+    if image_features.numel() == 0 or text_features.numel() == 0:
+        return
+
+    n = min(image_features.size(0), text_features.size(0), 2000)
+    img = image_features[:n]
+    txt = text_features[:n]
+    sub_labels = labels[:n] if labels is not None else None
+
+    combined = torch.cat([img, txt], dim=0)
+    reduced = TSNE(n_components=2, perplexity=30, random_state=42).fit_transform(combined.numpy())
+
+    img_reduced = reduced[:n]
+    txt_reduced = reduced[n:]
+
+    plt.figure(figsize=(8, 8))
+    if sub_labels is not None:
+        uniq = {k: idx for idx, k in enumerate(sorted(set(sub_labels)))}
+        cvals = [uniq[k] for k in sub_labels]
+        plt.scatter(img_reduced[:, 0], img_reduced[:, 1], c=cvals, cmap="tab20", s=10, alpha=0.75, marker="o", label="image")
+        plt.scatter(txt_reduced[:, 0], txt_reduced[:, 1], c=cvals, cmap="tab20", s=18, alpha=0.75, marker="x", label="text")
+    else:
+        plt.scatter(img_reduced[:, 0], img_reduced[:, 1], c="blue", s=10, alpha=0.75, marker="o", label="image")
+        plt.scatter(txt_reduced[:, 0], txt_reduced[:, 1], c="red", s=18, alpha=0.75, marker="x", label="text")
+
+    plt.title("Joint Image-Text Embedding t-SNE")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+
+def run_dbscan(features: torch.Tensor):
+    if features.numel() == 0:
+        return []
+    feats = features.numpy()
+    cluster = DBSCAN(eps=0.5, min_samples=4, metric="cosine")
+    return cluster.fit_predict(feats)
+
+
+def log_cluster_statistics(cluster_labels, total_samples: int) -> None:
+    if total_samples == 0:
+        print("---------------------------------")
+        print("Total samples: 0")
+        print("Clusters found: 0")
+        print("Noise samples: 0")
+        print("Average cluster size: 0.00")
+        print("---------------------------------")
+        return
+
+    valid_labels = [int(x) for x in cluster_labels if int(x) != -1]
+    noise_samples = int(sum(1 for x in cluster_labels if int(x) == -1))
+
+    if valid_labels:
+        count_by_cluster: Dict[int, int] = {}
+        for lb in valid_labels:
+            count_by_cluster[lb] = count_by_cluster.get(lb, 0) + 1
+        sizes = list(count_by_cluster.values())
+        num_clusters = len(count_by_cluster)
+        avg_cluster = float(sum(sizes)) / max(1, len(sizes))
+        max_cluster = max(sizes)
+        min_cluster = min(sizes)
+    else:
+        num_clusters = 0
+        avg_cluster = 0.0
+        max_cluster = 0
+        min_cluster = 0
+
+    print("---------------------------------")
+    print(f"Total samples: {total_samples}")
+    print(f"Clusters found: {num_clusters}")
+    print(f"Noise samples: {noise_samples}")
+    print(f"Average cluster size: {avg_cluster:.2f}")
+    print("---------------------------------")
+    print(f"Max cluster size: {max_cluster}")
+    print(f"Min cluster size: {min_cluster}")
+
+
 def train_one_epoch(
     model: Any,
     backend: str,
@@ -511,52 +669,20 @@ def train_one_epoch(
         batch_iter = tqdm(loader, desc=f"train e{epoch}", leave=False)
 
     for batch in batch_iter:
-        main_inputs = to_device(batch["main_inputs"], device)
-        rk1_tokens = to_device(batch["rk1_tokens"], device)
-        rk2_tokens = to_device(batch["rk2_tokens"], device)
-        rk3_tokens = to_device(batch["rk3_tokens"], device)
+        image_inputs = to_device(batch["image_inputs"], device)
+        text_inputs = to_device(batch["text_inputs"], device)
 
-        score_rk1 = batch["score_rk1"].to(device)
-        score_rk2 = batch["score_rk2"].to(device)
-        score_rk3 = batch["score_rk3"].to(device)
-        valid_mask = batch["valid_mask"].to(device)
-
-        image_feat = encode_image_features(model, backend, main_inputs["pixel_values"])
-        caption_feat = encode_text_features(model, backend, main_inputs)
-
-        B = batch["batch_size"]
-        A = len(FIELDS)
-
-        txt1 = encode_text_features(model, backend, rk1_tokens)
-        txt2 = encode_text_features(model, backend, rk2_tokens)
-        txt3 = encode_text_features(model, backend, rk3_tokens)
-
-        img_norm = image_feat / (image_feat.norm(dim=-1, keepdim=True) + 1e-6)
-        txt1 = txt1.view(B, A, -1)
-        txt2 = txt2.view(B, A, -1)
-        txt3 = txt3.view(B, A, -1)
-
-        txt1 = txt1 / (txt1.norm(dim=-1, keepdim=True) + 1e-6)
-        txt2 = txt2 / (txt2.norm(dim=-1, keepdim=True) + 1e-6)
-        txt3 = txt3 / (txt3.norm(dim=-1, keepdim=True) + 1e-6)
-
-        sim_rk1 = (img_norm.unsqueeze(1) * txt1).sum(dim=-1)
-        sim_rk2 = (img_norm.unsqueeze(1) * txt2).sum(dim=-1)
-        sim_rk3 = (img_norm.unsqueeze(1) * txt3).sum(dim=-1)
+        image_feat = encode_image_features(model, backend, image_inputs["pixel_values"])
+        caption_feat = encode_text_features(model, backend, text_inputs)
 
         logit_scale = model.logit_scale.exp()
 
         total_loss, stats = loss_fn(
             image_feat=image_feat,
             caption_feat=caption_feat,
+            image_to_text_mask=batch["image_to_text_mask"].to(device),
+            text_to_image_index=batch["text_to_image_index"].to(device),
             logit_scale=logit_scale,
-            sim_rk1=sim_rk1,
-            sim_rk2=sim_rk2,
-            sim_rk3=sim_rk3,
-            rerank_score_rk1=score_rk1,
-            rerank_score_rk2=score_rk2,
-            rerank_score_rk3=score_rk3,
-            valid_mask=valid_mask,
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -565,10 +691,11 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        meter["loss_total"] += float(stats["loss_total"].item()) * B
-        meter["loss_itc"] += float(stats["loss_itc"].item()) * B
-        meter["loss_rank"] += float(stats["loss_rank"].item()) * B
-        meter["n"] += B
+        bsz = batch["batch_size"]
+        meter["loss_total"] += float(stats["loss_total"].item()) * bsz
+        meter["loss_itc"] += float(stats["loss_itc"].item()) * bsz
+        meter["loss_rank"] += float(stats["loss_rank"].item()) * bsz
+        meter["n"] += bsz
 
     n = max(1, meter["n"])
     return {
@@ -591,14 +718,6 @@ def main() -> None:
     ap.add_argument("--weight_decay", type=float, default=2e-5)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--grad_clip", type=float, default=1.0)
-    ap.add_argument("--lambda_rank", type=float, default=0.2)
-    ap.add_argument("--margin12", type=float, default=0.15)
-    ap.add_argument("--margin13", type=float, default=0.20)
-    ap.add_argument("--margin23", type=float, default=0.05)
-    ap.add_argument("--conf_scale", type=float, default=8.0)
-    ap.add_argument("--conf_bias", type=float, default=0.05)
-    ap.add_argument("--use_itc_loss", type=int, default=1, choices=[0, 1])
-    ap.add_argument("--use_rank_loss", type=int, default=0, choices=[0, 1])
     ap.add_argument("--eval_batch_size", type=int, default=128)
     ap.add_argument("--train_image_root", type=str, default="/root/autodl-tmp/PSPD/dataset/CUHK-PEDES")
     ap.add_argument("--eval_image_root", type=str, default="/root/autodl-tmp/PSPD/dataset/CUHK-PEDES")
@@ -619,11 +738,6 @@ def main() -> None:
         )
     if not os.path.exists(args.test_jsonl):
         raise FileNotFoundError(f"test_jsonl not found: {args.test_jsonl}")
-
-    use_itc_loss = bool(args.use_itc_loss)
-    use_rank_loss = bool(args.use_rank_loss)
-    if (not use_itc_loss) and (not use_rank_loss):
-        raise ValueError("At least one loss must be enabled. Use --use_itc_loss 1 or --use_rank_loss 1.")
 
     cfg = load_cfg(args.config)
     device = cfg.get("device", "cuda")
@@ -719,16 +833,16 @@ def main() -> None:
         pin_memory=device.startswith("cuda"),
         collate_fn=build_collate(backend=backend, processor=processor, oc_preprocess=oc_preprocess, oc_tokenizer=oc_tokenizer),
     )
+    extract_loader = DataLoader(
+        dataset,
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=device.startswith("cuda"),
+        collate_fn=build_collate(backend=backend, processor=processor, oc_preprocess=oc_preprocess, oc_tokenizer=oc_tokenizer),
+    )
 
     rank_cfg = RankAuxConfig(
-        use_itc=use_itc_loss,
-        use_rank=use_rank_loss,
-        lambda_rank=args.lambda_rank,
-        base_margin_12=args.margin12,
-        base_margin_13=args.margin13,
-        base_margin_23=args.margin23,
-        conf_scale=args.conf_scale,
-        conf_bias=args.conf_bias,
     )
     loss_fn = ITCWithRankAuxLoss(rank_cfg)
 
@@ -809,6 +923,61 @@ def main() -> None:
 
         print(log_str)
         logger.info(log_str)
+
+        if epoch % 5 == 0:
+            try:
+                extracted = extract_all_image_embeddings(model=model, backend=backend, dataloader=extract_loader, device=device)
+                emb_save_path = os.path.join(args.save_dir, f"epoch_{epoch}_image_embeddings.pt")
+                torch.save(
+                    {
+                        "image_features": extracted["image_features"].cpu(),
+                        "text_features": extracted["text_features"].cpu(),
+                        "paths": extracted["paths"],
+                        "labels": extracted["labels"],
+                    },
+                    emb_save_path,
+                )
+                logger.info(f"saved embeddings: {emb_save_path}")
+
+                image_tsne_path = os.path.join(args.save_dir, f"epoch_{epoch:03d}_image_tsne.png")
+                text_tsne_path = os.path.join(args.save_dir, f"epoch_{epoch:03d}_text_tsne.png")
+                joint_tsne_path = os.path.join(args.save_dir, f"epoch_{epoch:03d}_joint_tsne.png")
+                visualize_image_tsne(features=extracted["image_features"], labels=extracted["labels"], save_path=image_tsne_path)
+                visualize_text_tsne(features=extracted["text_features"], labels=extracted["labels"], save_path=text_tsne_path)
+                visualize_joint_tsne(
+                    image_features=extracted["image_features"],
+                    text_features=extracted["text_features"],
+                    labels=extracted["labels"],
+                    save_path=joint_tsne_path,
+                )
+                logger.info(f"saved image/text/joint tsne: {image_tsne_path}, {text_tsne_path}, {joint_tsne_path}")
+
+                cluster_labels = run_dbscan(extracted["image_features"])
+                cluster_tensor = torch.tensor(cluster_labels, dtype=torch.long)
+                cluster_save_path = os.path.join(args.save_dir, f"epoch_{epoch:03d}_cluster_results.pt")
+                torch.save(
+                    {
+                        "features": extracted["image_features"].cpu(),
+                        "paths": extracted["paths"],
+                        "original_labels": extracted["labels"],
+                        "cluster_labels": cluster_tensor.cpu(),
+                    },
+                    cluster_save_path,
+                )
+
+                cluster_map = [
+                    {"image_path": path, "cluster_id": int(cid)}
+                    for path, cid in zip(extracted["paths"], cluster_labels)
+                ]
+                cluster_map_path = os.path.join(args.save_dir, f"epoch_{epoch:03d}_cluster_map.json")
+                with open(cluster_map_path, "w", encoding="utf-8") as f:
+                    json.dump(cluster_map, f, ensure_ascii=False, indent=2)
+
+                logger.info(f"saved cluster results: {cluster_save_path}")
+                logger.info(f"saved cluster map: {cluster_map_path}")
+                log_cluster_statistics(cluster_labels=cluster_labels, total_samples=int(extracted["image_features"].size(0)))
+            except Exception as exc:
+                logger.warning(f"embedding extraction/clustering failed at epoch {epoch}: {exc}")
     logger.info("========== Training Finished ==========")
 
 if __name__ == "__main__":

@@ -1,147 +1,89 @@
-from dataclasses import dataclass
-from typing import Dict, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
+from typing import Tuple, Dict
 
 
 @dataclass
 class RankAuxConfig:
-    use_itc: bool = True
-    use_rank: bool = False
-    lambda_rank: float = 0.2
-    base_margin_12: float = 0.15
-    base_margin_13: float = 0.20
-    base_margin_23: float = 0.05
-    conf_scale: float = 8.0
-    conf_bias: float = 0.05
     eps: float = 1e-6
+    max_logit_scale: float = 100.0  
 
 
 class ITCWithRankAuxLoss(nn.Module):
-    """
-    Total loss:
-        L = L_itc + lambda_rank * L_rank
-
-    Inputs (all tensors should be float and on same device):
-      image_feat:        [B, D]
-      caption_feat:      [B, D]
-      logit_scale:       scalar (e.g. CLIP exp(logit_scale))
-
-      sim_rk1:           [B, A]  similarity(image, attr_rk1_text)
-      sim_rk2:           [B, A]  similarity(image, attr_rk2_text)
-      sim_rk3:           [B, A]  similarity(image, attr_rk3_text)
-
-      rerank_score_rk1:  [B, A]  score from clip_rerank json final_rank[0].score
-      rerank_score_rk2:  [B, A]  score from clip_rerank json final_rank[1].score
-      rerank_score_rk3:  [B, A]  score from clip_rerank json final_rank[2].score
-
-      valid_mask:        [B, A]  1 for valid attr; 0 for unknown/missing
-    """
-
     def __init__(self, cfg: RankAuxConfig):
         super().__init__()
         self.cfg = cfg
 
     @staticmethod
-    def _l2_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    def _l2_normalize(x: torch.Tensor, eps: float) -> torch.Tensor:
         return x / (x.norm(dim=-1, keepdim=True) + eps)
-
-    def itc_loss(self, image_feat: torch.Tensor, caption_feat: torch.Tensor, logit_scale: torch.Tensor) -> torch.Tensor:
-        image_feat = self._l2_normalize(image_feat, self.cfg.eps)
-        caption_feat = self._l2_normalize(caption_feat, self.cfg.eps)
-
-        logits_i2t = logit_scale * image_feat @ caption_feat.t()
-        logits_t2i = logits_i2t.t()
-
-        target = torch.arange(image_feat.size(0), device=image_feat.device)
-        loss_i = F.cross_entropy(logits_i2t, target)
-        loss_t = F.cross_entropy(logits_t2i, target)
-        return 0.5 * (loss_i + loss_t)
-
-    def confidence_weight(
-        self,
-        rerank_score_rk1: torch.Tensor,
-        rerank_score_rk2: torch.Tensor,
-        rerank_score_rk3: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        # gap-based confidence: large (rk1-rk2,rk1-rk3) => higher weight
-        gap12 = rerank_score_rk1 - rerank_score_rk2
-        gap13 = rerank_score_rk1 - rerank_score_rk3
-        gap = 0.5 * (gap12 + gap13)
-
-        conf = torch.sigmoid(self.cfg.conf_scale * (gap - self.cfg.conf_bias))
-        conf = conf * valid_mask
-        return conf
-
-    def rank_loss(
-        self,
-        sim_rk1: torch.Tensor,
-        sim_rk2: torch.Tensor,
-        sim_rk3: torch.Tensor,
-        rerank_score_rk1: torch.Tensor,
-        rerank_score_rk2: torch.Tensor,
-        rerank_score_rk3: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        conf = self.confidence_weight(rerank_score_rk1, rerank_score_rk2, rerank_score_rk3, valid_mask)
-
-        # pairwise hinge ranking with confidence weighting
-        # encourage: rk1 > rk2, rk1 > rk3, weakly rk2 > rk3
-        l12 = F.relu(self.cfg.base_margin_12 - (sim_rk1 - sim_rk2))
-        l13 = F.relu(self.cfg.base_margin_13 - (sim_rk1 - sim_rk3))
-        l23 = F.relu(self.cfg.base_margin_23 - (sim_rk2 - sim_rk3))
-
-        per_attr = l12 + l13 + 0.5 * l23
-        weighted = per_attr * conf
-
-        denom = conf.sum() + self.cfg.eps
-        return weighted.sum() / denom
 
     def forward(
         self,
-        image_feat: torch.Tensor,
-        caption_feat: torch.Tensor,
+        image_feat: torch.Tensor,           # (B, D)
+        caption_feat: torch.Tensor,         # (T, D)  T = total captions in batch
+        image_to_text_mask: torch.Tensor,   # (B, T)  bool
+        text_to_image_index: torch.Tensor,  # (T,)
         logit_scale: torch.Tensor,
-        sim_rk1: torch.Tensor,
-        sim_rk2: torch.Tensor,
-        sim_rk3: torch.Tensor,
-        rerank_score_rk1: torch.Tensor,
-        rerank_score_rk2: torch.Tensor,
-        rerank_score_rk3: torch.Tensor,
-        valid_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        loss_itc = image_feat.new_zeros(())
-        loss_rank = image_feat.new_zeros(())
-        total = image_feat.new_zeros(())
 
-        if self.cfg.use_itc:
-            loss_itc = self.itc_loss(image_feat, caption_feat, logit_scale)
-            total = total + loss_itc
+        eps = self.cfg.eps
 
-        if self.cfg.use_rank:
-            loss_rank = self.rank_loss(
-                sim_rk1=sim_rk1,
-                sim_rk2=sim_rk2,
-                sim_rk3=sim_rk3,
-                rerank_score_rk1=rerank_score_rk1,
-                rerank_score_rk2=rerank_score_rk2,
-                rerank_score_rk3=rerank_score_rk3,
-                valid_mask=valid_mask,
-            )
-            total = total + self.cfg.lambda_rank * loss_rank
+        # -------- L2 normalize --------
+        image_feat = self._l2_normalize(image_feat, eps)
+        caption_feat = self._l2_normalize(caption_feat, eps)
 
-        if (not self.cfg.use_itc) and (not self.cfg.use_rank):
-            raise ValueError("At least one loss must be enabled: use_itc or use_rank.")
+        # -------- clamp temperature --------
+        logit_scale = logit_scale.clamp(max=self.cfg.max_logit_scale)
+
+        # -------- similarity --------
+        logits_i2t = logit_scale * image_feat @ caption_feat.t()  # (B, T)
+        logits_t2i = logits_i2t.t()                                # (T, B)
+
+        pos_logits_i = logits_i2t.masked_fill(~image_to_text_mask, float("-inf"))
+
+        # log sum exp over positives
+        pos_logsumexp_i = torch.logsumexp(pos_logits_i, dim=1)
+
+        # log sum exp over all
+        all_logsumexp_i = torch.logsumexp(logits_i2t, dim=1)
+
+        loss_i = -(pos_logsumexp_i - all_logsumexp_i).mean()
+
+
+        # 构造 text_to_image_mask  (T, B)
+        T = logits_t2i.size(0)
+        B = logits_t2i.size(1)
+
+        text_to_image_mask = torch.zeros(
+            (T, B),
+            dtype=torch.bool,
+            device=logits_t2i.device
+        )
+
+        text_indices = torch.arange(T, device=logits_t2i.device)
+        text_to_image_mask[text_indices, text_to_image_index] = True
+
+        pos_logits_t = logits_t2i.masked_fill(~text_to_image_mask, float("-inf"))
+
+        pos_logsumexp_t = torch.logsumexp(pos_logits_t, dim=1)
+        all_logsumexp_t = torch.logsumexp(logits_t2i, dim=1)
+
+        loss_t = -(pos_logsumexp_t - all_logsumexp_t).mean()
+
+
+        loss_itc = 0.5 * (loss_i + loss_t)
+        total_loss = loss_itc
 
         stats = {
-            "loss_total": total.detach(),
+            "loss_total": total_loss.detach(),
             "loss_itc": loss_itc.detach(),
-            "loss_rank": loss_rank.detach(),
+            "loss_rank": image_feat.new_zeros(()),
         }
-        return total, stats
+
+        return total_loss, stats
 
 
 __all__ = ["RankAuxConfig", "ITCWithRankAuxLoss"]
