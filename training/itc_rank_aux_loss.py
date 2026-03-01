@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Tuple, Dict
 
@@ -23,13 +22,16 @@ class ITCWithRankAuxLoss(nn.Module):
     def forward(
         self,
         image_feat: torch.Tensor,           # (B, D)
-        caption_feat: torch.Tensor,         # (T, D)  T = total captions in batch
-        image_to_text_mask: torch.Tensor,   # (B, T)  bool
-        text_to_image_index: torch.Tensor,  # (T,)
+        caption_feat: torch.Tensor,         # (B, D)
         logit_scale: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
         eps = self.cfg.eps
+
+        if image_feat.size(0) != caption_feat.size(0):
+            raise ValueError(
+                f"Expected one caption per image, but got image batch {image_feat.size(0)} and caption batch {caption_feat.size(0)}"
+            )
 
         # -------- L2 normalize --------
         image_feat = self._l2_normalize(image_feat, eps)
@@ -39,39 +41,12 @@ class ITCWithRankAuxLoss(nn.Module):
         logit_scale = logit_scale.clamp(max=self.cfg.max_logit_scale)
 
         # -------- similarity --------
-        logits_i2t = logit_scale * image_feat @ caption_feat.t()  # (B, T)
-        logits_t2i = logits_i2t.t()                                # (T, B)
+        logits_i2t = logit_scale * image_feat @ caption_feat.t()  # (B, B)
+        logits_t2i = logits_i2t.t()                                # (B, B)
 
-        pos_logits_i = logits_i2t.masked_fill(~image_to_text_mask, float("-inf"))
-
-        # log sum exp over positives
-        pos_logsumexp_i = torch.logsumexp(pos_logits_i, dim=1)
-
-        # log sum exp over all
-        all_logsumexp_i = torch.logsumexp(logits_i2t, dim=1)
-
-        loss_i = -(pos_logsumexp_i - all_logsumexp_i).mean()
-
-
-        # 构造 text_to_image_mask  (T, B)
-        T = logits_t2i.size(0)
-        B = logits_t2i.size(1)
-
-        text_to_image_mask = torch.zeros(
-            (T, B),
-            dtype=torch.bool,
-            device=logits_t2i.device
-        )
-
-        text_indices = torch.arange(T, device=logits_t2i.device)
-        text_to_image_mask[text_indices, text_to_image_index] = True
-
-        pos_logits_t = logits_t2i.masked_fill(~text_to_image_mask, float("-inf"))
-
-        pos_logsumexp_t = torch.logsumexp(pos_logits_t, dim=1)
-        all_logsumexp_t = torch.logsumexp(logits_t2i, dim=1)
-
-        loss_t = -(pos_logsumexp_t - all_logsumexp_t).mean()
+        targets = torch.arange(logits_i2t.size(0), device=logits_i2t.device)
+        loss_i = nn.functional.cross_entropy(logits_i2t, targets)
+        loss_t = nn.functional.cross_entropy(logits_t2i, targets)
 
 
         loss_itc = 0.5 * (loss_i + loss_t)

@@ -1,0 +1,28 @@
+# 核心深度学习框架
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+
+# Qwen2-VL 核心依赖
+transformers>=4.45.0
+accelerate>=0.26.0
+qwen-vl-utils
+modelscope
+sentencepiece
+protobuf
+
+# 图像处理与科学计算 (去掉版本号，让 pip 自动匹配 3.11)
+pillow
+opencv-python
+matplotlib
+numpy
+pandas
+scipy
+scikit-learn
+tqdm
+pyyaml
+
+# 评估
+pycocotools
+pycocoevalcap

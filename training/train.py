@@ -1,3 +1,5 @@
+"""ITC-only training entrypoint (warmup) extracted from run_train_itc_rank.py."""
+
 import argparse
 import json
 import os
@@ -684,10 +686,10 @@ def main() -> None:
     ap.add_argument("--train_jsonl", type=str, default="outputs/cuhk_train_caption.jsonl")
     ap.add_argument("--clip_model_path", type=str, default="/home/u2024218474/jupyterlab/PSPD/hf_models/openclip")
     ap.add_argument("--clip_backend", type=str, default="auto", choices=["auto", "hf", "open_clip"])
-    ap.add_argument("--save_dir", type=str, default="outputs/warmup_ckpt")
+    ap.add_argument("--save_dir", type=str, default="outputs/train_itc")
     ap.add_argument("--test_jsonl", type=str, default="outputs/cuhk_test_caption.jsonl")
-    ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument("--batch_size", type=int, default=512)
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--batch_size", type=int, default=384)
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--weight_decay", type=float, default=2e-5)
     ap.add_argument("--num_workers", type=int, default=4)
@@ -898,7 +900,7 @@ def main() -> None:
         print(log_str)
         logger.info(log_str)
 
-        if epoch % 2 == 0:
+        if epoch % 5 == 0:
             try:
                 extracted = extract_all_image_embeddings(model=model, backend=backend, dataloader=extract_loader, device=device)
                 emb_save_path = os.path.join(args.save_dir, f"epoch_{epoch}_image_embeddings.pt")

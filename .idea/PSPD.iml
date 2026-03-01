@@ -2,7 +2,7 @@
 <module type="PYTHON_MODULE" version="4">
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$" />
-    <orderEntry type="jdk" jdkName="Remote /root/autodl-tmp/env (sftp://root@connect.bjb1.seetacloud.com:38562null)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Remote /home/u2024218474/jupyterlab/env (sftp://u2024218474@210.45.253.131:26802null)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>

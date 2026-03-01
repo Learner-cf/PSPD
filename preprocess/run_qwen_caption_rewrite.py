@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -204,33 +205,19 @@ class QwenCaptionRewriter:
             attrs[key] = value if value else "unknown"
         return attrs
 
-    def generate_multi_captions(self, image: Image.Image, attrs: Dict[str, str]) -> List[str]:
-        captions: List[str] = []
-        for style in STYLE_ORDER:
-            prompt = build_style_prompt(style=style, attrs=attrs)
-            cap = self.ask_image_question(image, prompt).strip()
-            if "\n" in cap:
-                cap = cap.splitlines()[0].strip()
-            cap = cap.strip(" :")
-            if cap:
-                captions.append(cap)
-
-        uniq: List[str] = []
-        seen = set()
-        for c in captions:
-            if c in seen:
-                continue
-            seen.add(c)
-            uniq.append(c)
-        while len(uniq) < 5:
-            uniq.append(uniq[-1] if uniq else "a person")
-        return uniq[:5]
+    def generate_single_caption(self, image: Image.Image, attrs: Dict[str, str], style: str) -> str:
+        prompt = build_style_prompt(style=style, attrs=attrs)
+        cap = self.ask_image_question(image, prompt).strip()
+        if "\n" in cap:
+            cap = cap.splitlines()[0].strip()
+        cap = cap.strip(" :")
+        return cap if cap else "a person"
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True)
-    ap.add_argument("--image_dir", type=str, required=True, default="/root/autodl-tmp/PSPD/dataset/CUHK-PEDES",help="Directory containing input person images")
+    ap.add_argument("--image_dir", type=str, required=True, default="/home/u2024218474/jupyterlab/PSPD/dataset/CUHK-PEDES",help="Directory containing input person images")
     ap.add_argument("--output", type=str, default="outputs/cuhk_caption_multi.jsonl")
     ap.add_argument("--recursive", type=int, default=1, choices=[0, 1])
     ap.add_argument("--max_images", type=int, default=-1)
@@ -238,6 +225,8 @@ def main() -> None:
 
     cfg = load_cfg(args.config)
     device = cfg.get("device", "cuda")
+    random_seed = int(cfg.get("seed", 42))
+    rng = random.Random(random_seed)
 
     cr_cfg = cfg.get("caption_rewrite", {})
     model_name = cr_cfg.get("hf_model_name", cfg.get("extractor", {}).get("hf_model_name"))
@@ -261,14 +250,14 @@ def main() -> None:
     for image_path in tqdm(image_paths, desc="qwen-caption-rewrite"):
         image = Image.open(image_path).convert("RGB")
         attrs = rewriter.extract_attributes(image)
-        captions = rewriter.generate_multi_captions(image, attrs)
+        selected_style = rng.choice(STYLE_ORDER)
+        caption = rewriter.generate_single_caption(image, attrs, selected_style)
         out_rows.append(
             {
                 "image_path": image_path,
-                "captions": captions,
-                "caption": captions[0],
+                "caption": caption,
                 "caption_rewrite": {
-                    "styles": STYLE_ORDER,
+                    "style": selected_style,
                     "auto_attributes": attrs,
                 },
             }
