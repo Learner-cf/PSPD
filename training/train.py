@@ -43,6 +43,42 @@ def setup_logger(save_dir: str):
     return logger
 
 # =============== 原有代码从这继续 ===============
+class CLIPFeatureWrapper(torch.nn.Module):
+    def __init__(self, base_model: Any, backend: str):
+        super().__init__()
+        self.base_model = base_model
+        self.backend = backend
+
+    def forward(
+        self,
+        mode: str,
+        pixel_values: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if mode == "image":
+            if self.backend == "hf":
+                return self.base_model.get_image_features(pixel_values=pixel_values)
+            return self.base_model.encode_image(pixel_values)
+
+        if mode == "text":
+            if self.backend == "hf":
+                return self.base_model.get_text_features(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+            return self.base_model.encode_text(input_ids)
+
+        raise ValueError(f"Unsupported mode: {mode}")
+
+
+def unwrap_core_model(model: Any) -> Any:
+    if isinstance(model, torch.nn.DataParallel):
+        model = model.module
+    if isinstance(model, CLIPFeatureWrapper):
+        model = model.base_model
+    return model
+
 def resolve_clip_backend(backend: str, model_path: str) -> str:
     b = (backend or "auto").strip().lower()
     if b in {"hf", "open_clip"}:
@@ -72,11 +108,21 @@ def load_clip_components(model_path: str, backend: str, device: str):
     raise ValueError(f"Unsupported clip backend: {backend}")
 
 def encode_image_features(model: Any, backend: str, pixel_values: torch.Tensor) -> torch.Tensor:
+    if isinstance(model, (torch.nn.DataParallel, CLIPFeatureWrapper)):
+        return model(mode="image", pixel_values=pixel_values)
+
     if backend == "hf":
         return model.get_image_features(pixel_values=pixel_values)
     return model.encode_image(pixel_values)
 
 def encode_text_features(model: Any, backend: str, tokens: Dict[str, torch.Tensor]) -> torch.Tensor:
+    if isinstance(model, (torch.nn.DataParallel, CLIPFeatureWrapper)):
+        return model(
+            mode="text",
+            input_ids=tokens["input_ids"],
+            attention_mask=tokens.get("attention_mask"),
+        )
+
     if backend == "hf":
         return model.get_text_features(
             input_ids=tokens["input_ids"],
@@ -90,6 +136,8 @@ def set_text_trainable(
     train_encoder: bool,
     train_proj: bool,
 ) -> None:
+    model = unwrap_core_model(model)
+
     if backend == "hf":
         if hasattr(model, "text_model"):
             for p in model.text_model.parameters():
@@ -653,7 +701,8 @@ def train_one_epoch(
         image_feat = encode_image_features(model, backend, image_inputs["pixel_values"])
         caption_feat = encode_text_features(model, backend, text_inputs)
 
-        logit_scale = model.logit_scale.exp()
+        core_model = unwrap_core_model(model)
+        logit_scale = core_model.logit_scale.exp()
 
         total_loss, stats = loss_fn(
             image_feat=image_feat,
@@ -683,13 +732,13 @@ def train_one_epoch(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default="configs/default.yaml")
-    ap.add_argument("--train_jsonl", type=str, default="outputs/cuhk_train_caption.jsonl")
+    ap.add_argument("--train_jsonl", type=str, default="outputs/initial_caption.jsonl")
     ap.add_argument("--clip_model_path", type=str, default="/home/u2024218474/jupyterlab/PSPD/hf_models/openclip")
     ap.add_argument("--clip_backend", type=str, default="auto", choices=["auto", "hf", "open_clip"])
-    ap.add_argument("--save_dir", type=str, default="outputs/train_itc")
+    ap.add_argument("--save_dir", type=str, default="outputs/initial_itc")
     ap.add_argument("--test_jsonl", type=str, default="outputs/cuhk_test_caption.jsonl")
     ap.add_argument("--epochs", type=int, default=10)
-    ap.add_argument("--batch_size", type=int, default=384)
+    ap.add_argument("--batch_size", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--weight_decay", type=float, default=2e-5)
     ap.add_argument("--num_workers", type=int, default=4)
@@ -719,6 +768,9 @@ def main() -> None:
     device = cfg.get("device", "cuda")
     if device.startswith("cuda") and not torch.cuda.is_available():
         device = "cpu"
+
+    if device.startswith("cuda"):
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -772,6 +824,8 @@ def main() -> None:
     )
     logger.info(f"clip backend: {backend}")
 
+    model = CLIPFeatureWrapper(model, backend)
+
     freeze_text_encoder = bool(args.freeze_text_encoder)
     freeze_text_proj = bool(args.freeze_text_proj)
 
@@ -788,6 +842,11 @@ def main() -> None:
 
     trainable_params, total_params = count_trainable_params(model)
     logger.info(f"trainable params: {trainable_params}/{total_params}")
+
+    if device.startswith("cuda") and torch.cuda.device_count() > 1:
+        gpu_count = torch.cuda.device_count()
+        logger.info(f"multi-gpu enabled: DataParallel on {gpu_count} GPUs")
+        model = torch.nn.DataParallel(model)
 
     dataset = ITCRankDataset(args.train_jsonl, image_roots=train_image_roots)
     if len(dataset) == 0:
@@ -874,7 +933,7 @@ def main() -> None:
 
         ckpt = {
             "epoch": epoch,
-            "model": model.state_dict(),
+            "model": unwrap_core_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "stats": stats,
             "rank_cfg": asdict(rank_cfg),

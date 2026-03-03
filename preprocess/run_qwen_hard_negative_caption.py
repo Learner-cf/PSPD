@@ -142,12 +142,26 @@ class HardNegativeCaptionGenerator:
         self.device = device
         self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
         dtype = torch.float16 if device.startswith("cuda") else torch.float32
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        ).to(device)
+
+        use_multi_gpu = device.startswith("cuda") and torch.cuda.device_count() > 1
+        if use_multi_gpu:
+            self.model = AutoModelForVision2Seq.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+                device_map="auto",
+            )
+            self.input_device = next(self.model.parameters()).device
+            print(f"[info] multi-gpu enabled for hard-negative caption: {torch.cuda.device_count()} GPUs, input_device={self.input_device}")
+        else:
+            self.model = AutoModelForVision2Seq.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+            ).to(device)
+            self.input_device = torch.device(device)
         self.model.eval()
 
         self.generation_cfg = dict(generation_cfg)
@@ -175,7 +189,7 @@ class HardNegativeCaptionGenerator:
 
         all_images = [ensure_min_image_size(target_img)] + [ensure_min_image_size(x) for x in neighbor_imgs]
         inputs = self.processor(text=chat_text, images=all_images, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        inputs = {k: v.to(self.input_device) for k, v in inputs.items()}
         input_len = inputs["input_ids"].shape[-1]
         out = self.model.generate(**inputs, **self.generation_cfg)
         gen_ids = out[0][input_len:]
@@ -194,7 +208,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--top_k", type=int, default=2)
     ap.add_argument("--neighbors_key", type=str, default="out_cluster_neighbors",
                     help="Neighbor list key in neighbor_groups.json (default: out_cluster_neighbors)")
-    ap.add_argument("--batch_size", type=int, default=32,
+    ap.add_argument("--batch_size", type=int, default=128,
                     help="Number of samples processed per chunk for caption generation")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return ap.parse_args()

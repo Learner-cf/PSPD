@@ -39,19 +39,6 @@ teacher:
   local_weights_path: "/home/u2024218474/jupyterlab/PSPD/hf_models/openclip/open_clip_pytorch_model.bin"
   tau_teacher: 0.01
 
-field_ranking:
-  enabled: true
-  delta_margin:
-    gender: 0.02
-    upper_type: 0.02
-    upper_color: 0.02
-    lower_type: 0.02
-    lower_color: 0.02
-  delta_global: 0.03
-
-lexicon:
-  path: "configs/lexicon.yaml"
-  max_per_field: 250
 
 labels:
   colors: ["black","white","gray","red","blue","green","brown","yellow"]
@@ -62,8 +49,7 @@ labels:
 caption_rewrite:
   hf_model_name: "/home/u2024218474/jupyterlab/PSPD/hf_models/Qwen2-VL-7B-Instruct"
   generation:
-    max_new_tokens: 48
-    do_sample: true
-    temperature: 0.9
-    top_p: 0.9
-    repetition_penalty: 1.05
+    max_new_tokens: 64
+    do_sample: False
+    num_beams: 1
+    repetition_penalty: 1.1

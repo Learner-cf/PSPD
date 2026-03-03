@@ -358,11 +358,11 @@ def save_json(path: str, data: Any) -> None:
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Generate hard-negative neighbor groups from image embeddings.")
-    ap.add_argument("--checkpoint", type=str, default="/home/u2024218474/jupyterlab/PSPD/outputs/warmup_ckpt/best.pt")
+    ap.add_argument("--checkpoint", type=str, default="/home/u2024218474/jupyterlab/PSPD/outputs/warmup_ckpt/epoch_003.pt")
     ap.add_argument("--image_root", type=str, default="/home/u2024218474/jupyterlab/PSPD/dataset/CUHK-PEDES")
-    ap.add_argument("--subset_jsonl", type=str, default="/home/u2024218474/jupyterlab/PSPD/outputs/cuhk_train_qwen_caption_v2.jsonl", help="Optional jsonl to restrict clustering/DBSCAN to a subset (e.g., training set)")
+    ap.add_argument("--subset_jsonl", type=str, default="/home/u2024218474/jupyterlab/PSPD/outputs/cuhk_train_caption.jsonl", help="Optional jsonl to restrict clustering/DBSCAN to a subset (e.g., training set)")
     ap.add_argument("--subset_key", type=str, default="image_path", help="Key in subset_jsonl rows that stores image path")
-    ap.add_argument("--batch_size", type=int, default=256)
+    ap.add_argument("--batch_size", type=int, default=216)
     ap.add_argument("--top_k_neighbors", type=int, default=10)
     ap.add_argument("--eps", type=float, default=0.50)
     ap.add_argument("--min_samples", type=int, default=3)
@@ -372,11 +372,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--clip_backend", type=str, default="auto", choices=["auto", "hf", "open_clip"])
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
-    ap.add_argument("--rerank_distance", type=str, default="/home/u2024218474/jupyterlab/PSPD/outputs/rerank3/final_distance.npy", help="Optional path to final_distance.npy for precomputed DBSCAN clustering")
-    ap.add_argument("--dbscan_metric", type=str, default="auto", choices=["auto", "cosine", "precomputed"])
+    ap.add_argument("--rerank_distance", type=str, default="/home/u2024218474/jupyterlab/PSPD/outputs/dualdistance3/final_distance.npy", help="Optional path to final_distance.npy for precomputed DBSCAN clustering")
+    ap.add_argument("--dbscan_metric", type=str, default="precomputed", choices=["auto", "cosine", "precomputed"])
     ap.add_argument("--in_cluster_k", type=int, default=3, help="Preferred in-cluster neighbors per sample")
     ap.add_argument("--out_cluster_k", type=int, default=2, help="Preferred out-cluster neighbors per sample")
-    ap.add_argument("--rerank_paths", type=str, default="/home/u2024218474/jupyterlab/PSPD/outputs/rerank3/rerank_paths.json", help="Optional json list of image paths used when computing rerank distance")
+    ap.add_argument("--rerank_paths", type=str, default="/home/u2024218474/jupyterlab/PSPD/outputs/dualdistance3/rerank_paths.json", help="Optional json list of image paths used when computing rerank distance")
     return ap.parse_args()
 
 

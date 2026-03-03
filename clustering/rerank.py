@@ -80,7 +80,7 @@ def _find_nearby_embedding_file(parent: Path, epoch: Optional[int]) -> Optional[
         ])
 
     candidates.extend([
-        parent / "epoch_5_image_embeddings.pt",
+        parent / "epoch_3_image_embeddings.pt",
         parent / "features.pt",
     ])
 
@@ -310,8 +310,8 @@ def rerank(features: torch.Tensor, output_dir: str, image_paths: Optional[List[s
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="k-reciprocal re-ranking for unsupervised ReID clustering")
-    ap.add_argument("--features", type=str, default="/root/autodl-tmp/PSPD/outputs/warmup_ckpt/epoch_2_image_embeddings.pt", help="Path to features.pt")
-    ap.add_argument("--output_dir", type=str, default="/root/autodl-tmp/PSPD/outputs/dualdistance3")
+    ap.add_argument("--features", type=str, default="/home/u2024218474/jupyterlab/PSPD/outputs/warmup_ckpt/epoch_3_image_embeddings.pt", help="Path to features.pt")
+    ap.add_argument("--output_dir", type=str, default="/home/u2024218474/jupyterlab/PSPD/outputs/dualdistance3")
     return ap.parse_args()
 
 

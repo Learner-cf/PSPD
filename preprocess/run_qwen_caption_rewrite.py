@@ -146,12 +146,25 @@ class QwenCaptionRewriter:
         self.device = device
         self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
         dtype = torch.float16 if device.startswith("cuda") else torch.float32
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        ).to(device)
+        use_multi_gpu = device.startswith("cuda") and torch.cuda.device_count() > 1
+        if use_multi_gpu:
+            self.model = AutoModelForVision2Seq.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+                device_map="auto",
+            )
+            self.input_device = next(self.model.parameters()).device
+            print(f"[info] multi-gpu enabled for caption rewrite: {torch.cuda.device_count()} GPUs, input_device={self.input_device}")
+        else:
+            self.model = AutoModelForVision2Seq.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+            ).to(device)
+            self.input_device = torch.device(device)
         self.model.eval()
         self.min_image_side = int(min_image_side)
 
@@ -181,7 +194,7 @@ class QwenCaptionRewriter:
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image = self._ensure_image_ok(image)
         inputs = self.processor(text=text, images=image, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        inputs = {k: v.to(self.input_device) for k, v in inputs.items()}
         input_len = inputs["input_ids"].shape[-1]
         out = self.model.generate(**inputs, **self.gen_cfg)
         gen_ids = out[0][input_len:]
