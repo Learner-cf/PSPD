@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="u2024218474@210.45.253.131:26802 password" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="u2024218474@210.45.253.131:26807 password" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
       <paths name="root@connect.bjb1.seetacloud.com:29470 password">
@@ -131,6 +131,13 @@
             <excludedPath path="/home/u2024218474/jupyterlab/PSPD/dataset" />
             <excludedPath path="/home/u2024218474/jupyterlab/PSPD/hf_models" />
           </excludedPaths>
+        </serverdata>
+      </paths>
+      <paths name="u2024218474@210.45.253.131:26807 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/u2024218474/jupyterlab/PSPD" local="$PROJECT_DIR$" />
+          </mappings>
         </serverdata>
       </paths>
     </serverData>

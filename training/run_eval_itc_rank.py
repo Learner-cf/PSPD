@@ -1,100 +1,77 @@
 import argparse
-import os
 from typing import Dict, List
 
 import torch
+import yaml
 
-from training.run_train_itc_rank import (
-    RetrievalEvalDataset,
-    evaluate_retrieval,
-    load_cfg,
-    load_clip_components,
-    resolve_clip_backend,
-)
+from data_mvp.datasets import Sample, load_cuhk, load_icfg, load_rstp
+from models.dino_backbone import DinoV2Backbone
 
 
-def collect_eval_image_roots(cfg: Dict, eval_image_root: str) -> List[str]:
-    eval_image_roots: List[str] = []
-    if eval_image_root:
-        eval_image_roots.append(eval_image_root)
+def load_cfg(path: str) -> Dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
-    datasets_cfg = cfg.get("datasets", {})
-    if isinstance(datasets_cfg, dict):
-        for _, ds_cfg in datasets_cfg.items():
-            if isinstance(ds_cfg, dict):
-                root = ds_cfg.get("image_root", "")
-                if root:
-                    eval_image_roots.append(root)
-                    parent = os.path.dirname(root.rstrip("/"))
-                    if parent:
-                        eval_image_roots.append(parent)
 
-    dedup_roots: List[str] = []
-    seen_roots = set()
-    for r in eval_image_roots:
-        rr = os.path.abspath(r)
-        if rr in seen_roots:
-            continue
-        seen_roots.add(rr)
-        dedup_roots.append(rr)
-    return dedup_roots
+def build_samples(cfg: Dict, dataset: str, split: str) -> List[Sample]:
+    dcfg = cfg["datasets"][dataset]
+    image_root = dcfg["image_root"]
+    ann_file = dcfg["ann_file"]
+    if dataset == "cuhk":
+        samples = load_cuhk(ann_file, image_root)
+    elif dataset == "icfg":
+        samples = load_icfg(ann_file, image_root)
+    else:
+        samples = load_rstp(ann_file, image_root)
+    return [s for s in samples if s.split == split]
+
+
+@torch.no_grad()
+def evaluate(backbone: DinoV2Backbone, samples: List[Sample], device: str, batch_size: int = 128) -> Dict[str, float]:
+    from torch.utils.data import DataLoader
+    from PIL import Image
+
+    def collate_fn(batch_samples: List[Sample]):
+        images = [Image.open(s.image_path).convert("RGB") for s in batch_samples]
+        x = backbone.preprocess(images=images, return_tensors="pt")["pixel_values"]
+        pids = torch.tensor([s.pid for s in batch_samples], dtype=torch.long)
+        return x, pids
+
+    loader = DataLoader(samples, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    feats, pids = [], []
+    backbone.eval()
+    for x, y in loader:
+        x = x.to(device)
+        feats.append(backbone(x).cpu())
+        pids.append(y)
+
+    feat = torch.cat(feats, dim=0)
+    pid = torch.cat(pids, dim=0)
+    sim = feat @ feat.t()
+    sim.fill_diagonal_(-1e9)
+    idx = sim.argmax(dim=1)
+    pred = pid[idx]
+    rank1 = (pred == pid).float().mean().item()
+    return {"rank1": rank1}
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Evaluate CLIP checkpoint without training.")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default="configs/default.yaml")
-    ap.add_argument("--test_jsonl", type=str, required=True)
-    ap.add_argument("--clip_model_path", type=str, default="/root/autodl-tmp/PSPD/hf_models/openclip")
-    ap.add_argument("--clip_backend", type=str, default="auto", choices=["auto", "hf", "open_clip"])
-    ap.add_argument("--eval_batch_size", type=int, default=256)
-    ap.add_argument("--eval_image_root", type=str, default="/root/autodl-tmp/PSPD/dataset/CUHK-PEDES ")
-    ap.add_argument("--show_progress", type=int, default=1, choices=[0, 1])
+    ap.add_argument("--dataset", type=str, required=True, choices=["cuhk", "icfg", "rstp"])
+    ap.add_argument("--split", type=str, default="test")
+    ap.add_argument("--dino_model_path", type=str, default="/home/u2024218474/jupyterlab/PSPD/hf_models/AI-ModelScope/dinov2-giant")
     args = ap.parse_args()
-
-    if not os.path.exists(args.test_jsonl):
-        raise FileNotFoundError(f"test_jsonl not found: {args.test_jsonl}")
 
     cfg = load_cfg(args.config)
     device = cfg.get("device", "cuda")
     if device.startswith("cuda") and not torch.cuda.is_available():
         device = "cpu"
 
-    roots = collect_eval_image_roots(cfg=cfg, eval_image_root=args.eval_image_root)
-
-    backend = resolve_clip_backend(args.clip_backend, args.clip_model_path)
-    model, processor, oc_preprocess, oc_tokenizer = load_clip_components(
-        model_path=args.clip_model_path,
-        backend=backend,
-        device=device,
-    )
-    print(f"[info] clip backend: {backend}")
-
-    eval_dataset = RetrievalEvalDataset(args.test_jsonl, image_roots=roots)
-    if len(eval_dataset.image_paths) == 0:
-        raise RuntimeError(
-            "No valid evaluation images found. Please check --test_jsonl paths or set --eval_image_root. "
-            "Current roots: " + str(roots)
-        )
-
-    stats = evaluate_retrieval(
-        model=model,
-        backend=backend,
-        processor=processor,
-        oc_preprocess=oc_preprocess,
-        oc_tokenizer=oc_tokenizer,
-        eval_dataset=eval_dataset,
-        device=device,
-        batch_size=args.eval_batch_size,
-        show_progress=bool(args.show_progress),
-        epoch=0,
-    )
-
-    print(
-        f"[eval] rank1={stats['rank1']:.4f} "
-        f"rank5={stats['rank5']:.4f} "
-        f"rank10={stats['rank10']:.4f} "
-        f"mAP={stats['mAP']:.4f}"
-    )
+    samples = build_samples(cfg, args.dataset, args.split)
+    backbone = DinoV2Backbone(model_path=args.dino_model_path).to(device)
+    stats = evaluate(backbone, samples, device)
+    print(f"[eval] rank1={stats['rank1']:.4f}")
 
 
 if __name__ == "__main__":
